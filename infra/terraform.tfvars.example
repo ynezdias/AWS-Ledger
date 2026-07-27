@@ -1,0 +1,19 @@
+# Copy this file to "terraform.tfvars" and fill in real values.
+# terraform.tfvars is git-ignored so your settings stay private.
+
+aws_region  = "us-east-2"
+environment = "dev"
+
+# This bucket ALREADY EXISTS (created via AWS CLI in Step 1). If you later adopt
+# Terraform, import it instead of recreating:
+#   terraform import aws_s3_bucket.data_lake aws-ledger-datamoon-870730509769
+data_bucket_name = "aws-ledger-datamoon-870730509769"
+
+# From your Google Sheet URL:
+# https://docs.google.com/spreadsheets/d/THIS_LONG_ID/edit
+google_sheet_id    = "PASTE_YOUR_SHEET_ID_HERE"
+google_sheet_range = "Sheet1"
+
+# How aggressively to drain (smaller interval = smaller sheet at any moment).
+drain_schedule   = "rate(3 minutes)"
+drain_batch_rows = 20000

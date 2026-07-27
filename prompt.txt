@@ -1,0 +1,39 @@
+Ok now do the same drill for C:\Users\ydias\OneDrive\Desktop\DataMoon Data\DataMoon\Loan4
+1. Make sure this data is worth it and genuine. Perform some operations and search it over the web to verify this data. I work at a buisness funding company and i need to make sure my reps get a 100% verified data to contact these people. 
+2. Compare Loan4 data with the aws leadpool data (C:\Users\ydias\OneDrive\Desktop\DataMoon Data\aws lead pool) save create a list of data called as data overlap of the data that is in rest of the files in datamoon (C:\Users\ydias\OneDrive\Desktop\DataMoon Data\DataMoon) and aws lead pool (C:\Users\ydias\OneDrive\Desktop\DataMoon Data\aws lead pool) as well. Save it here C:\Users\ydias\OneDrive\Desktop\DataMoon Data\Overlap
+3. Save the final data in Final Leads withouat any overlaps or duplications purely refined data to hand over to the reps. Evene if address, name, email doesn't exist I don't want you to drop that data keep it at the end of the refined data. We will use it in future.
+
+
+Task: Validate, deduplicate, and refine the Loan1 lead list for rep handoff.
+
+Inputs
+
+DataMoon source: C:\Users\ydias\OneDrive\Desktop\DataMoon Data\DataMoon\Loan4
+Lead pool (already-contacted / existing): C:\Users\ydias\OneDrive\Desktop\DataMoon Data\aws lead pool
+
+Match key (defines a "duplicate" or "overlap"): primary = [email OR phone]; fallback = normalized name + street address. Normalize before matching: lowercase, trim whitespace, strip punctuation from phones (digits only), standardize address abbreviations (St/Street, etc.).
+
+Step 1 — Validate data quality (replaces "web verification")
+Run these checks on Loan1 and produce a short quality report (counts for each):
+
+Required fields present: name AND address must be non-empty. Drop any row missing both name and a usable address.
+Phone valid: correct digit count, not a placeholder (e.g., 000-000-0000, 123-456-7890, all-same-digit).
+Email valid syntax (if present) and not junk (test@, noreply@, example.com).
+Flag obvious placeholder/test entries and remove them.
+Detect and remove internal duplicates within Loan1 using the match key.
+(Optional) Cross-reference business names against public business registries / web to confirm the company exists — do this as a flag, not a hard delete.
+Output: quality_report.txt summarizing rows in, rows dropped and why, rows remaining.
+
+Step 2 — Overlap with lead pool
+
+Compare cleaned Loan4 against the aws lead pool using the match key.
+Any Loan4 record that also appears in the aws lead pool → write to the Overlap list.
+Save it in : C:\Users\ydias\OneDrive\Desktop\DataMoon Data\Overlap (include which source(s) each record matched).
+
+Step 3 — Final leads
+
+Take cleaned Loan4, remove every record found in Step 2 (no lead-pool overlaps) and all duplicates.
+Keep records even if LinkedIn is missing — name + address is sufficient; LinkedIn is optional/blank-ok.
+Save it in: C:\Users\ydias\OneDrive\Desktop\DataMoon Data\Final Leads
+Columns (keep consistent): Name, Address, Phone, Email, LinkedIn (optional), Company, Source, Date_added.
+

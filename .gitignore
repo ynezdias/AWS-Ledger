@@ -1,0 +1,56 @@
+# ---- Secrets & credentials (NEVER commit these) ----
+*.tfvars
+!*.tfvars.example
+*.pem
+*.key
+credentials.json
+service-account*.json
+Key/
+.env
+.env.*
+
+# ---- Terraform ----
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+override.tf
+override.tf.json
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# ---- Lambda build artifacts ----
+*.zip
+lambda_build/
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ---- Lead data: NEVER commit (consumer PII + far over GitHub size limits) ----
+# These hold names, personal emails, mobile numbers, home addresses, income
+# range, net worth, marital/children status. Git history is permanent, so once
+# any of this is committed it cannot be cleanly removed. Keep it in S3/RDS only.
+DataMoon/
+exports/
+*.csv
+*.xlsx
+*.db
+*.sqlite
+*.sqlite3
+overlap_history.sql
+
+# Small aggregate reports (counts only, no PII) are allowed back in:
+!RECURRING_WORKED_LEADS_REPORT.txt
+!docs/**/*.md

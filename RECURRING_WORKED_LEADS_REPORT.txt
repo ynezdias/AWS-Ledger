@@ -1,0 +1,60 @@
+RECURRING DATAMOON LEADS vs LEAD POOL - work-history brief
+generated 2026-07-27 17:46 UTC
+========================================================================
+
+SCOPE
+  DataMoon match keys that have ever overlapped the pool : 19851
+  Distinct pool leads those keys resolve to              : 16441
+  ...of which have a real work signal                    : 7196
+  ...of which arrived in DataMoon more than once         : 188
+
+HOW RECENTLY THE POOL LEAD WAS WORKED
+  never_worked       9245
+  0-7d               4676
+  8-30d              2508
+  180d+                 6
+  31-90d                4
+  91-180d               2
+
+VERDICT
+  RELEASE - in pool but never worked            9241
+  SUPPRESS - worked in last 30d                 7111
+  SUPPRESS - already a deal/funded                80
+  SUPPRESS - do_not_issue                          9
+
+MATCHED ON
+  phone              8294
+  email              4948
+  email+phone        3199
+
+SF STATUS (top)
+  Pending                         9101
+  (none)                          6647
+  AI Outreach                      266
+  Hot Lead                         250
+  Converted                         89
+  Sent Application                  20
+  Pending Bad Leads                 19
+  No Answer                         13
+  Follow-Up                          8
+  Interested                         5
+  Not Interested                     4
+  Waiting For You                    4
+
+WHAT 'WORKED' MEANS HERE
+  A lead counts as worked if ANY of these carry a timestamp:
+    last_issued_at     issued to a rep
+    last_shopped_at    shopped to a funder
+    last_funded_at     funded
+    ai_last            AI outreach
+    tb_last            TextBolt SMS
+    email_out_last     outbound email
+    email_in_last      inbound email reply
+    task_last          rep task logged
+  sf_synced_at is EXCLUDED on purpose - 2.9M leads carry it and it maxes
+  out at today, so it is a bulk Salesforce sync stamp, not a human touch.
+
+OUTPUT
+  recurring_worked_leads.csv
+  one row per pool lead, sorted most-recently-worked first;
+  the 'reason' column spells out why each row is in the list.
