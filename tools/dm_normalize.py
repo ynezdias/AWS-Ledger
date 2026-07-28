@@ -95,8 +95,37 @@ def _to_canon(df):
         if c not in df.columns: df[c]=""
     return df[CANON]
 
-def load_any(path, chunksize=100000):
-    """Yield canonical DataFrames from a csv / csv.gz / xlsx / jsonl.gz file."""
+KEY_SRC_COLS = ["personal_emails","business_email","additional_personal_emails",
+                "personal_phone","mobile_phone"]
+
+def key_yield(df):
+    """Fraction of rows carrying at least one email or phone we could key on.
+
+    A layout we don't have a mapping for produces all-empty canonical columns,
+    which looks EXACTLY like a clean run: nothing dedups, nothing overlaps, and
+    every row is reported as net-new. Callers check this and refuse to continue
+    rather than publish a confident-looking empty result."""
+    if len(df)==0: return 0.0
+    have=None
+    for c in KEY_SRC_COLS:
+        if c not in df.columns: continue
+        col=df[c].fillna("").astype(str).str.strip()!=""
+        have=col if have is None else (have|col)
+    return 0.0 if have is None else float(have.mean())
+
+def load_any(path, chunksize=100000, stats=None):
+    """Yield canonical DataFrames from a csv / csv.gz / xlsx / jsonl.gz file.
+
+    `stats` (optional dict) accumulates rows silently dropped as unparseable, so
+    the caller can report them instead of losing rows to a stderr warning."""
+    import warnings
+    if stats is None: stats={}
+    stats.setdefault("bad_lines",0)
+
+    def _bump(caught):
+        for w in caught:
+            if "Skipping line" in str(w.message): stats["bad_lines"]+=1
+
     low=path.lower()
     if low.endswith(".jsonl.gz") or low.endswith(".jsonl"):
         op = gzip.open if low.endswith(".gz") else open
@@ -105,16 +134,26 @@ def load_any(path, chunksize=100000):
             for line in f:
                 line=line.strip()
                 if not line: continue
-                rows.append(json.loads(line))
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    stats["bad_lines"]+=1; continue
                 if len(rows)>=chunksize:
                     yield _to_canon(pd.DataFrame(rows).astype(str)); rows=[]
         if rows: yield _to_canon(pd.DataFrame(rows).astype(str))
     elif low.endswith(".xlsx"):
         yield _to_canon(pd.read_excel(path, dtype=str, engine="openpyxl").fillna(""))
     else:
-        for chunk in pd.read_csv(path, dtype=str, chunksize=chunksize,
-                                 keep_default_na=False, na_values=[],
-                                 engine="c", on_bad_lines="warn"):
+        reader=pd.read_csv(path, dtype=str, chunksize=chunksize,
+                           keep_default_na=False, na_values=[],
+                           engine="c", on_bad_lines="warn")
+        while True:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                try: chunk=next(reader)
+                except StopIteration: chunk=None
+                _bump(caught)
+            if chunk is None: break
             yield _to_canon(chunk)
 
 # ---------------------------------------------------------------- dedup
@@ -159,10 +198,30 @@ def dedupe(df, progress=print):
         if i and i%200000==0: progress(f"    union {i:,}/{N:,}")
     del seen
 
-    df["_root"]=[find(i) for i in range(N)]
+    roots=[find(i) for i in range(N)]
+    df["_root"]=roots
     df["_email_keys"]=[";".join(sorted(ek[i])) for i in range(N)]
     df["_phone_keys"]=[";".join(sorted(pk[i])) for i in range(N)]
     df["_na_key"]=na
+
+    # Union every member's match keys onto the group. The winner row below is
+    # picked by completeness, so without this the keys contributed ONLY by the
+    # rows it absorbed are lost -- and those keys are exactly what the lead-pool
+    # overlap step matches on. Losing one silently turns an existing lead into
+    # a "net-new" one.
+    root_em={}; root_ph={}
+    for i in range(N):
+        r=roots[i]
+        if ek[i]: root_em.setdefault(r,set()).update(ek[i])
+        if pk[i]: root_ph.setdefault(r,set()).update(pk[i])
+
+    # Same treatment for provenance: one surviving lead can be the merge of rows
+    # that arrived in several different raw files, so record ALL of them.
+    root_src={}
+    if "_source_file" in df.columns:
+        srcs=df["_source_file"].tolist()
+        for i in range(N):
+            if srcs[i]: root_src.setdefault(roots[i],set()).add(srcs[i])
     df["_score"]=(df[CANON]!="").sum(axis=1).astype(int)
     df["_merged"]=df.groupby("_root")["_root"].transform("size")
 
@@ -170,7 +229,13 @@ def dedupe(df, progress=print):
     bcols=CANON+["_email_keys","_phone_keys","_na_key"]
     winners=ds[["_root"]+bcols].replace("",pd.NA).groupby("_root",sort=False).first().reset_index()
     meta=ds.groupby("_root",sort=False).agg(merged_from_rows=("_merged","first")).reset_index()
-    out=winners.merge(meta,on="_root",how="left").fillna("").drop(columns=["_root"])
+    out=winners.merge(meta,on="_root",how="left").fillna("")
+    # Overwrite the winner's own keys with the whole group's union (see above).
+    out["_email_keys"]=[";".join(sorted(root_em.get(r,()))) for r in out["_root"]]
+    out["_phone_keys"]=[";".join(sorted(root_ph.get(r,()))) for r in out["_root"]]
+    if root_src:
+        out["source_file"]=[";".join(sorted(root_src.get(r,()))) for r in out["_root"]]
+    out=out.drop(columns=["_root"])
     out=out.rename(columns={"_email_keys":"email_norm","_phone_keys":"phone_e164","_na_key":"name_addr_key"})
     out["record_complete"]=((out["first_name"]!="")&(out["last_name"]!="")&
                             (out["personal_address"]!="")&

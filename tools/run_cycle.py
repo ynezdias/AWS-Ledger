@@ -62,48 +62,100 @@ def fetch_raw(src_dt):
     return files
 
 # ---------------------------------------------------------------- 2-3. normalize+dedup
+# Below this share of rows carrying an email/phone we assume the layout wasn't
+# recognised rather than that the data is genuinely that poor. Override with
+# MIN_KEY_YIELD=0 to force a run through.
+MIN_KEY_YIELD = float(os.environ.get("MIN_KEY_YIELD", "0.5"))
+
 def normalize_dedup(files):
-    frames=[]; total=0
+    frames=[]; total=0; stats={"bad_lines":0}
     for f in files:
-        n=0
-        for chunk in N.load_any(f):
+        n=0; base=os.path.basename(f)
+        for chunk in N.load_any(f, stats=stats):
+            # Provenance: which raw file this row arrived in. dedupe() unions
+            # these across a merge group, so a lead built from rows in two files
+            # ends up listing both.
+            chunk["_source_file"]=base
             frames.append(chunk); n+=len(chunk)
-        log(f"  loaded {n:>9,}  {os.path.basename(f)}"); total+=n
+        log(f"  loaded {n:>9,}  {base}"); total+=n
     df=pd.concat(frames,ignore_index=True).fillna(""); del frames
     log(f"TOTAL rows in: {total:,}")
+    if stats["bad_lines"]:
+        log(f"  WARNING: {stats['bad_lines']:,} unparseable line(s) skipped — "
+            f"these are NOT in the counts above")
+
+    # Refuse to publish a confident-looking empty result (see N.key_yield).
+    ky=N.key_yield(df)
+    log(f"Key yield: {100*ky:.1f}% of rows have an email or phone")
+    if ky < MIN_KEY_YIELD:
+        raise SystemExit(
+            f"\nABORT: only {100*ky:.1f}% of rows carry an email or phone "
+            f"(threshold {100*MIN_KEY_YIELD:.0f}%).\n"
+            f"This almost always means a NEW column layout that dm_normalize.UPPER_MAP\n"
+            f"does not cover, so every match key came out blank. Nothing was written.\n"
+            f"Columns seen: {sorted(c for c in df.columns if not c.startswith('_'))[:15]}\n"
+            f"Fix the mapping, or set MIN_KEY_YIELD=0 to force the run.")
+
     log("Normalizing + transitive dedup...")
     uniq=N.dedupe(df, progress=log)
     log(f"Unique after dedup: {len(uniq):,}  (internal duplicates: {total-len(uniq):,})")
-    return total, uniq
+
+    # REAL integrity check: dedupe records each winner's group size, so those
+    # sizes must add back up to the row count we read. This catches a row being
+    # dropped or double-counted; comparing rows_in to dups+unique cannot, since
+    # dups is DERIVED from unique and the comparison is true by construction.
+    grp=pd.to_numeric(uniq["merged_from_rows"],errors="coerce").fillna(0).astype(int).sum()
+    if grp != total:
+        raise SystemExit(f"ABORT: dedup lost rows — group sizes sum to {grp:,} "
+                         f"but {total:,} rows were read. Nothing was written.")
+    log(f"Integrity: group sizes sum to {grp:,} = rows in  (OK)")
+    return total, uniq, stats
 
 # ---------------------------------------------------------------- 4. overlap
 def overlap(uniq):
+    """Chunked, self-healing pool matching. One giant temp-table join proved
+    fragile (connection died mid-query at 1.5M keys); instead probe the pool
+    index in 50k-key ANY() chunks — each query is seconds — and reconnect+retry
+    a chunk on network error."""
     secret=sh("aws","secretsmanager","get-secret-value","--secret-id","lead-pool/postgres",
               "--region","us-east-2","--query","SecretString","--output","text")
     d=json.loads(secret)
-    import pg8000
-    conn=pg8000.connect(host=d.get("host") or "lead-pool.c364acm8wlnv.us-east-2.rds.amazonaws.com",
-        port=int(d.get("port",5432)), database=d.get("dbname") or "leadpool",
-        user=d.get("username"), password=d.get("password"), ssl_context=True, timeout=180)
-    cur=conn.cursor()
-    def match(keys, tbl, col):
+    import pg8000, time
+    def fresh_conn():
+        return pg8000.connect(host=d.get("host") or "lead-pool.c364acm8wlnv.us-east-2.rds.amazonaws.com",
+            port=int(d.get("port",5432)), database=d.get("dbname") or "leadpool",
+            user=d.get("username"), password=d.get("password"), ssl_context=True, timeout=180)
+    state={"conn":fresh_conn()}
+    def match(keys, tbl, col, label):
         if not keys: return set()
-        cur.execute("DROP TABLE IF EXISTS dm_keys"); conn.commit()
-        cur.execute("CREATE TEMP TABLE dm_keys (v text)")
-        for i in range(0,len(keys),50000):
-            cur.execute("INSERT INTO dm_keys(v) SELECT unnest(%s::text[])",(keys[i:i+50000],))
-        conn.commit()
-        cur.execute(f"CREATE INDEX ON dm_keys(v)")
-        cur.execute(f"SELECT DISTINCT k.v FROM dm_keys k JOIN {tbl} t ON t.{col}=k.v")
-        m={r[0] for r in cur.fetchall()}
-        cur.execute("DROP TABLE dm_keys"); conn.commit()
-        return m
+        out=set(); B=int(os.environ.get("DM_PROBE_CHUNK","200000"))  # raised 50k->200k
+        for i in range(0,len(keys),B):
+            chunk=keys[i:i+B]
+            for attempt in range(4):
+                try:
+                    cur=state["conn"].cursor()
+                    cur.execute(f"SELECT DISTINCT {col} FROM {tbl} WHERE {col} = ANY(%s)",(chunk,))
+                    out.update(r[0] for r in cur.fetchall())
+                    break
+                except Exception as e:
+                    log(f"    {label} chunk {i//B+1}: {type(e).__name__} (attempt {attempt+1}/4) — reconnecting")
+                    try: state["conn"].close()
+                    except Exception: pass
+                    time.sleep(3*(attempt+1))
+                    state["conn"]=fresh_conn()
+            else:
+                raise RuntimeError(f"pool match failed after retries ({label} chunk {i//B+1})")
+            done=min(i+B,len(keys))
+            if (i//B)%10==9 or done==len(keys):
+                log(f"    {label}: probed {done:,}/{len(keys):,}  (matched so far {len(out):,})")
+        return out
     allph=list({k for v in uniq["phone_e164"] for k in str(v).split(";") if k})
     allem=list({k for v in uniq["email_norm"] for k in str(v).split(";") if k})
     log(f"Matching {len(allph):,} phones / {len(allem):,} emails vs lead pool...")
-    mph=match(allph,"lead_phones","phone_e164")
-    mem=match(allem,"lead_emails","email_norm")
-    conn.close()
+    mph=match(allph,"lead_phones","phone_e164","phones")
+    mem=match(allem,"lead_emails","email_norm","emails")
+    try: state["conn"].close()
+    except Exception: pass
     log(f"  matched keys: {len(mph):,} phones, {len(mem):,} emails")
 
     inpool=[];mt=[];mk=[]
@@ -118,12 +170,72 @@ def overlap(uniq):
     uniq["in_lead_pool"]=inpool; uniq["match_type"]=mt; uniq["matched_pool_keys"]=mk
     return uniq
 
+# ---------------------------------------------------------------- store phase
+def store(uniq, nn, ov, p_ov, src_dt, ts):
+    """Load the three RDS tables + S3 export. Network-resilient: COPYs are
+    chunked with reconnect inside copy_rows; apply_overlaps is one retryable
+    transaction."""
+    import time
+    log("\nStoring to AWS...")
+    connh={"conn":S.connect()}
+    try:
+        # One store at a time, ever: two concurrent stores for the same date
+        # interleave their DELETE+COPY and double the tables (this happened on
+        # 2026-07-28). The advisory lock is held by THIS session until it
+        # disconnects; a second run aborts immediately instead of corrupting.
+        cur=connh["conn"].cursor()
+        cur.execute("SELECT pg_try_advisory_lock(hashtext('datamoon_store'))")
+        if not cur.fetchone()[0]:
+            raise SystemExit("Another store is already running against RDS "
+                             "(advisory lock 'datamoon_store' is held). "
+                             "Wait for it to finish and re-run.")
+        S.load_datamoon_leads(connh, uniq, src_dt, ts, progress=log)
+        S.load_datamoon_refined(connh, nn, src_dt, ts, progress=log)
+        for attempt in range(3):
+            try:
+                S.apply_overlaps(connh, ov, src_dt, progress=log)
+                break
+            except Exception as e:
+                log(f"  apply_overlaps: {type(e).__name__} (attempt {attempt+1}/3) — reconnecting")
+                try: connh["conn"].close()
+                except Exception: pass
+                time.sleep(5); connh["conn"]=S.connect()
+        else:
+            raise RuntimeError("apply_overlaps failed after retries")
+        S.upload_overlaps_s3(p_ov, src_dt, progress=log)
+        cur=connh["conn"].cursor()
+        cur.execute("SELECT count(*) FROM datamoon_refined"); tot_ref=cur.fetchone()[0]
+        cur.execute("SELECT count(*) FROM lead_overlaps"); tot_ent=cur.fetchone()[0]
+        cur.execute("SELECT count(*) FROM lead_overlaps WHERE distinct_days>1"); rep=cur.fetchone()[0]
+    finally:
+        try: connh["conn"].close()
+        except Exception: pass
+    return tot_ref, tot_ent, rep
+
+def store_only(src_dt):
+    """Resume a cycle whose compute finished but whose store failed: reuse the
+    local CSVs in DataMoon/cycle_<dt>/ instead of recomputing everything."""
+    ts=dt.datetime.now(dt.timezone.utc)
+    outdir=os.path.join(LOCAL_ROOT,f"cycle_{src_dt}")
+    p_all=os.path.join(outdir,"combined_normalized_unique.csv")
+    p_ov =os.path.join(outdir,"overlapping.csv")
+    p_nn =os.path.join(outdir,"final_ready_leads.csv")
+    for p in (p_all,p_ov,p_nn):
+        if not os.path.exists(p): raise SystemExit(f"missing {p} — run the full cycle instead")
+    log(f"store-only for {src_dt}: loading local CSVs...")
+    uniq=pd.read_csv(p_all,dtype=str,keep_default_na=False)
+    ov  =pd.read_csv(p_ov ,dtype=str,keep_default_na=False)
+    nn  =pd.read_csv(p_nn ,dtype=str,keep_default_na=False)
+    log(f"  unique={len(uniq):,}  overlap={len(ov):,}  net-new={len(nn):,}")
+    tot_ref,tot_ent,rep = store(uniq, nn, ov, p_ov, src_dt, ts)
+    log(f"\nDONE. datamoon_refined total={tot_ref:,}; lead_overlaps {tot_ent:,} entities ({rep:,} repeat).")
+
 # ---------------------------------------------------------------- main
 def main(src_dt):
     ts=dt.datetime.now(dt.timezone.utc)
     log(f"\n{'='*64}\nDataMoon cycle  dt={src_dt}   started {ts:%Y-%m-%d %H:%M:%S} UTC\n{'='*64}")
     files=fetch_raw(src_dt)
-    rows_in, uniq = normalize_dedup(files)
+    rows_in, uniq, stats = normalize_dedup(files)
     uniq = overlap(uniq)
 
     ov=uniq[uniq["in_lead_pool"]=="yes"].copy()
@@ -137,21 +249,10 @@ def main(src_dt):
     ov.to_csv(p_ov,index=False,quoting=csv.QUOTE_MINIMAL)
     nn.drop(columns=["in_lead_pool","match_type","matched_pool_keys"]).to_csv(p_nn,index=False,quoting=csv.QUOTE_MINIMAL)
 
-    log("\nStoring to AWS...")
-    conn=S.connect()
-    try:
-        S.load_datamoon_leads(conn, uniq, src_dt, ts, progress=log)
-        S.load_datamoon_refined(conn, nn, src_dt, ts, progress=log)
-        S.apply_overlaps(conn, ov, src_dt, progress=log)
-        S.upload_overlaps_s3(p_ov, src_dt, progress=log)
-        cur=conn.cursor()
-        cur.execute("SELECT count(*) FROM datamoon_refined"); tot_ref=cur.fetchone()[0]
-        cur.execute("SELECT count(*) FROM lead_overlaps"); tot_ent=cur.fetchone()[0]
-        cur.execute("SELECT count(*) FROM lead_overlaps WHERE distinct_days>1"); rep=cur.fetchone()[0]
-    finally:
-        conn.close()
+    tot_ref, tot_ent, rep = store(uniq, nn, ov, p_ov, src_dt, ts)
 
     U=len(uniq); n_ov=len(ov); n_nn=len(nn)
+    grp_sum=int(pd.to_numeric(uniq["merged_from_rows"],errors="coerce").fillna(0).sum())
     rep_txt=f"""DataMoon Cycle Report — dt={src_dt}
 {'='*56}
 Raw files processed:        {len(files)}
@@ -163,7 +264,10 @@ OVERLAP vs AWS lead pool (phone OR email; EIN not present in DataMoon)
   Already in pool:          {n_ov:,}  ({100*n_ov/U:.1f}%)
   NET-NEW refined:          {n_nn:,}  ({100*n_nn/U:.1f}%)
 
-RECONCILE  {rows_in:,} = {rows_in-U:,} dup + {n_ov:,} overlap + {n_nn:,} net-new  ->  {'BALANCED' if (rows_in-U)+n_ov+n_nn==rows_in else 'MISMATCH'}
+RECONCILE  {rows_in:,} = {rows_in-U:,} dup + {n_ov:,} overlap + {n_nn:,} net-new
+  Merge groups sum to source rows:  {grp_sum:,} vs {rows_in:,}   -> {'OK' if grp_sum==rows_in else 'MISMATCH'}
+  Overlap + net-new cover uniques:  {n_ov+n_nn:,} vs {U:,}       -> {'OK' if n_ov+n_nn==U else 'MISMATCH'}
+  Unparseable lines skipped:        {stats['bad_lines']:,}
 
 Stored in RDS datamoon:
   datamoon_leads     {U:,} rows for this date
@@ -176,5 +280,9 @@ Local: {outdir}
     log("\n"+rep_txt)
 
 if __name__=="__main__":
-    d = sys.argv[1] if len(sys.argv)>1 else f"{dt.datetime.now():%Y-%m-%d}"
-    main(d)
+    args=[a for a in sys.argv[1:] if a!="--store-only"]
+    d = args[0] if args else f"{dt.datetime.now():%Y-%m-%d}"
+    if "--store-only" in sys.argv:
+        store_only(d)
+    else:
+        main(d)
