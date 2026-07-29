@@ -205,53 +205,101 @@ def tier_of(score):
     if score >= 35: return "T3"
     return "T4"
 
-# ------------------------------------------------- reflect tiers onto lead tables
-def reflect_tiers(connh, progress=print):
-    """Copy lead_overlaps.tier onto datamoon_leads and datamoon_refined by key
-    match (email/phone). Rows whose keys never overlapped the pool keep tier
-    NULL — no tier is invented for a lead that has no analysis behind it.
-    Set-based SQL, server-side; idempotent (full re-derive each run)."""
+# ------------------------------------------- tier every lead by data quality
+# Every row in datamoon_leads / datamoon_refined gets a tier. Two evidence
+# levels, applied in order:
+#   1. QUALITY (all rows): how good and workable is the record itself —
+#      funding-themed source, valid phone AND email, complete record,
+#      decision-maker title. This is what reps can act on for leads that
+#      have no overlap history.
+#   2. BEHAVIOR (overlap rows only): the lead_overlaps tier overwrites the
+#      quality tier where it exists — observed behavior beats record quality.
+# Idempotent: fully recomputed on every run.
+LEADS_QUALITY_SQL = """
+UPDATE datamoon_leads SET tier = CASE
+  WHEN source_file ~* 'quick.?business|merchant_cash|b2c'
+       AND has_valid_phone = 'true' AND has_valid_email = 'true'
+       AND is_complete = 'true'
+       AND (job_title ~* 'owner|founder|ceo|president|principal|partner|chief'
+            OR lower(coalesce(seniority,'')) IN ('cxo','owner','founder','director','vp'))
+    THEN 'T1'
+  WHEN (source_file ~* 'quick.?business|merchant_cash|b2c'
+        AND has_valid_phone = 'true' AND has_valid_email = 'true')
+    OR (source_file ~* 'quick.?business|merchant_cash|b2c'
+        AND (has_valid_phone = 'true' OR has_valid_email = 'true')
+        AND (job_title ~* 'owner|founder|ceo|president|principal|partner|chief'
+             OR lower(coalesce(seniority,'')) IN ('cxo','owner','founder','director','vp')))
+    OR (has_valid_phone = 'true' AND has_valid_email = 'true' AND is_complete = 'true'
+        AND (job_title ~* 'owner|founder|ceo|president|principal|partner|chief'
+             OR lower(coalesce(seniority,'')) IN ('cxo','owner','founder','director','vp')))
+    THEN 'T2'
+  WHEN (source_file ~* 'quick.?business|merchant_cash|b2c'
+        AND (has_valid_phone = 'true' OR has_valid_email = 'true'))
+    OR (has_valid_phone = 'true' AND has_valid_email = 'true' AND is_complete = 'true')
+    THEN 'T3'
+  ELSE 'T4'
+END
+"""
+REFINED_QUALITY_SQL = """
+UPDATE datamoon_refined SET tier = CASE
+  WHEN refined_status = 'clean' AND source_file ~* 'quick.?business|merchant_cash|b2c'
+       AND email_valid AND phone_valid
+    THEN 'T1'
+  WHEN refined_status = 'clean'
+       AND ((source_file ~* 'quick.?business|merchant_cash|b2c'
+             AND (email_valid OR phone_valid))
+            OR (email_valid AND phone_valid))
+    THEN 'T2'
+  WHEN (refined_status = 'clean' AND (email_valid OR phone_valid))
+    OR (source_file ~* 'quick.?business|merchant_cash|b2c'
+        AND email_valid AND phone_valid)
+    THEN 'T3'
+  ELSE 'T4'
+END
+"""
+
+def apply_lead_tiers(connh, progress=print):
     cur = connh["conn"].cursor()
     cur.execute("ALTER TABLE datamoon_leads ADD COLUMN IF NOT EXISTS tier text")
     cur.execute("ALTER TABLE datamoon_refined ADD COLUMN IF NOT EXISTS tier text")
     connh["conn"].commit()
 
-    # datamoon_leads: keys live in ';'-joined email_all/phone_all
-    cur.execute("""
-        CREATE TEMP TABLE dl_tier AS
-        SELECT k.source_dt, k.row_id, min(lo.tier) AS tier
-        FROM (
-            SELECT source_dt, row_id,
-                   unnest(string_to_array(coalesce(email_all,'') || ';' ||
-                                          coalesce(phone_all,''), ';')) AS key
-            FROM datamoon_leads
-        ) k
-        JOIN lead_overlaps lo ON lo.match_key = k.key AND lo.tier IS NOT NULL
-        GROUP BY k.source_dt, k.row_id""")
-    cur.execute("""UPDATE datamoon_leads dl SET tier = t.tier
-                   FROM dl_tier t
-                   WHERE dl.source_dt = t.source_dt AND dl.row_id = t.row_id""")
-    n_leads = cur.rowcount
-    cur.execute("DROP TABLE dl_tier")
-    connh["conn"].commit()
+    # pass 1: quality tier for every row
+    cur.execute(LEADS_QUALITY_SQL); n1 = cur.rowcount; connh["conn"].commit()
+    cur = connh["conn"].cursor()
+    cur.execute(REFINED_QUALITY_SQL); n2 = cur.rowcount; connh["conn"].commit()
+    progress(f"  quality tiers set: datamoon_leads {n1:,}, datamoon_refined {n2:,}")
 
-    # datamoon_refined: single email_norm / phone_e164 keys
+    # pass 2: overlap behavior overrides quality where it exists
     cur = connh["conn"].cursor()
     cur.execute("""
-        CREATE TEMP TABLE dr_tier AS
+        CREATE TEMP TABLE dl_ov AS
+        SELECT k.source_dt, k.row_id, min(lo.tier) AS tier
+        FROM (SELECT source_dt, row_id,
+                     unnest(string_to_array(coalesce(email_all,'') || ';' ||
+                                            coalesce(phone_all,''), ';')) AS key
+              FROM datamoon_leads) k
+        JOIN lead_overlaps lo ON lo.match_key = k.key AND lo.tier IS NOT NULL
+        GROUP BY 1, 2""")
+    cur.execute("""UPDATE datamoon_leads dl SET tier = t.tier FROM dl_ov t
+                   WHERE dl.source_dt = t.source_dt AND dl.row_id = t.row_id
+                     AND dl.tier IS DISTINCT FROM t.tier""")
+    n3 = cur.rowcount
+    cur.execute("DROP TABLE dl_ov")
+    cur.execute("""
+        CREATE TEMP TABLE dr_ov AS
         SELECT r.row_id, min(lo.tier) AS tier
         FROM datamoon_refined r
         JOIN lead_overlaps lo ON lo.tier IS NOT NULL
              AND lo.match_key IN (r.email_norm, r.phone_e164)
-        GROUP BY r.row_id""")
-    cur.execute("""UPDATE datamoon_refined r SET tier = t.tier
-                   FROM dr_tier t WHERE r.row_id = t.row_id""")
-    n_ref = cur.rowcount
-    cur.execute("DROP TABLE dr_tier")
+        GROUP BY 1""")
+    cur.execute("""UPDATE datamoon_refined r SET tier = t.tier FROM dr_ov t
+                   WHERE r.row_id = t.row_id AND r.tier IS DISTINCT FROM t.tier""")
+    n4 = cur.rowcount
+    cur.execute("DROP TABLE dr_ov")
     connh["conn"].commit()
-    progress(f"  tier reflected: datamoon_leads {n_leads:,} rows, "
-             f"datamoon_refined {n_ref:,} rows (others stay NULL — never overlapped)")
-    return n_leads, n_ref
+    progress(f"  overlap behavior overrides: datamoon_leads {n3:,}, datamoon_refined {n4:,}")
+    return n1, n2
 
 # ---------------------------------------------------------------- main analysis
 def analyze(src_dt, progress=print):
@@ -370,8 +418,8 @@ def analyze(src_dt, progress=print):
             cur.execute(f"SELECT count(*) FROM {name}")
             progress(f"  {name}: +{len(rows):,} rows for {src_dt} (table total {cur.fetchone()[0]:,})")
 
-        # ---- 4. reflect tiers onto datamoon_leads / datamoon_refined ----
-        reflect_tiers(connh, progress)
+        # ---- 4. tier every lead in datamoon_leads / datamoon_refined ----
+        apply_lead_tiers(connh, progress)
 
         # ---- 5. local CSV copies ----
         outdir = os.path.join(LOCAL_ROOT, f"cycle_{src_dt}")
