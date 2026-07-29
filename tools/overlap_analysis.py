@@ -205,6 +205,54 @@ def tier_of(score):
     if score >= 35: return "T3"
     return "T4"
 
+# ------------------------------------------------- reflect tiers onto lead tables
+def reflect_tiers(connh, progress=print):
+    """Copy lead_overlaps.tier onto datamoon_leads and datamoon_refined by key
+    match (email/phone). Rows whose keys never overlapped the pool keep tier
+    NULL — no tier is invented for a lead that has no analysis behind it.
+    Set-based SQL, server-side; idempotent (full re-derive each run)."""
+    cur = connh["conn"].cursor()
+    cur.execute("ALTER TABLE datamoon_leads ADD COLUMN IF NOT EXISTS tier text")
+    cur.execute("ALTER TABLE datamoon_refined ADD COLUMN IF NOT EXISTS tier text")
+    connh["conn"].commit()
+
+    # datamoon_leads: keys live in ';'-joined email_all/phone_all
+    cur.execute("""
+        CREATE TEMP TABLE dl_tier AS
+        SELECT k.source_dt, k.row_id, min(lo.tier) AS tier
+        FROM (
+            SELECT source_dt, row_id,
+                   unnest(string_to_array(coalesce(email_all,'') || ';' ||
+                                          coalesce(phone_all,''), ';')) AS key
+            FROM datamoon_leads
+        ) k
+        JOIN lead_overlaps lo ON lo.match_key = k.key AND lo.tier IS NOT NULL
+        GROUP BY k.source_dt, k.row_id""")
+    cur.execute("""UPDATE datamoon_leads dl SET tier = t.tier
+                   FROM dl_tier t
+                   WHERE dl.source_dt = t.source_dt AND dl.row_id = t.row_id""")
+    n_leads = cur.rowcount
+    cur.execute("DROP TABLE dl_tier")
+    connh["conn"].commit()
+
+    # datamoon_refined: single email_norm / phone_e164 keys
+    cur = connh["conn"].cursor()
+    cur.execute("""
+        CREATE TEMP TABLE dr_tier AS
+        SELECT r.row_id, min(lo.tier) AS tier
+        FROM datamoon_refined r
+        JOIN lead_overlaps lo ON lo.tier IS NOT NULL
+             AND lo.match_key IN (r.email_norm, r.phone_e164)
+        GROUP BY r.row_id""")
+    cur.execute("""UPDATE datamoon_refined r SET tier = t.tier
+                   FROM dr_tier t WHERE r.row_id = t.row_id""")
+    n_ref = cur.rowcount
+    cur.execute("DROP TABLE dr_tier")
+    connh["conn"].commit()
+    progress(f"  tier reflected: datamoon_leads {n_leads:,} rows, "
+             f"datamoon_refined {n_ref:,} rows (others stay NULL — never overlapped)")
+    return n_leads, n_ref
+
 # ---------------------------------------------------------------- main analysis
 def analyze(src_dt, progress=print):
     progress("\nOverlapping analysis (step 6)...")
@@ -322,7 +370,10 @@ def analyze(src_dt, progress=print):
             cur.execute(f"SELECT count(*) FROM {name}")
             progress(f"  {name}: +{len(rows):,} rows for {src_dt} (table total {cur.fetchone()[0]:,})")
 
-        # ---- 4. local CSV copies ----
+        # ---- 4. reflect tiers onto datamoon_leads / datamoon_refined ----
+        reflect_tiers(connh, progress)
+
+        # ---- 5. local CSV copies ----
         outdir = os.path.join(LOCAL_ROOT, f"cycle_{src_dt}")
         os.makedirs(outdir, exist_ok=True)
         for fname, rows in ((f"t1_t2_{src_dt}.csv", t12), (f"t3_t4_{src_dt}.csv", t34)):
