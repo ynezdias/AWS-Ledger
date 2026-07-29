@@ -2,17 +2,23 @@
 STEP 6 — Overlapping analysis: who should we re-contact?
 
 Runs AFTER the daily store (datamoon_leads / datamoon_refined / lead_overlaps /
-S3 export are all written and verified). Scores every entity in lead_overlaps
-behaviorally, drops repliers/opt-outs/deals/cool-off, and writes the T1+T2
-targets into two RDS tables:
+S3 export are all written and verified). Scores EVERY entity in lead_overlaps
+behaviorally and tiers it T1..T4. Nothing is dropped: repliers, opt-outs,
+deals and cool-off leads keep their rows and are marked in contact_status.
 
-  recontacting_overlaps  T1/T2 targets WITH a phone number
-  upleads_list           T1/T2 targets WITHOUT a phone (email-only; enrich later)
+Writes:
+  lead_overlaps.tier       new column — every key's current tier, refreshed daily
+  t1_t2                    CURRENT-STATE table of T1+T2 entities (reach out now).
+                           Fully rebuilt each run; leads move in/out as their
+                           signals change day to day.
+  t3_t4                    CURRENT-STATE table of T3+T4 entities (stored for
+                           later; promoted automatically when signals appear).
+  recontacting_overlaps    per-cycle-date SNAPSHOT of contactable T1/T2 with a
+                           phone (history of what each day's run recommended)
+  upleads_list             per-cycle-date SNAPSHOT of contactable T1/T2 without
+                           a phone (email-only; enrich later)
 
-Idempotent per cycle_date: re-running a date replaces that date's rows.
-Local CSV copies land in DataMoon/cycle_<dt>/.
-
-Scoring (see prompt_overlap_analysis.txt for the full method and its caveats):
+Scoring (see prompt_overlap_analysis.txt for the method and its caveats):
   +40 funding-themed source file   (INFERRED FROM VENDOR FILE NAME ONLY —
                                     confirm with vendor whether these segments
                                     are intent-based or modeled lookalikes)
@@ -23,7 +29,12 @@ Scoring (see prompt_overlap_analysis.txt for the full method and its caveats):
   +10 decision-maker title
   +5  validated contact data
   -30 worked by a rep in the last 30 days
-Tiers: T1 >=70, T2 >=50, T3 >=35, T4 below. Only T1/T2 are stored.
+Tiers: T1 >=70, T2 >=50, T3 >=35, T4 below.
+
+contact_status values: ok | replied_interested | replied_later | replied_other |
+opted_out (DO NOT CONTACT) | deal_or_do_not_issue | cooloff_recently_worked.
+Repliers are worked through the reply track (interested_recent_ranked CSVs);
+opted_out must never be contacted regardless of tier.
 
 Usage:  python tools/overlap_analysis.py 2026-07-29     (needs DM_SECRET set)
 """
@@ -46,7 +57,7 @@ TABLE_COLS = [
     "key_type", "matched_on", "overlap_hits", "distinct_days",
     "first_seen", "last_seen", "source_files", "n_sources",
     "intent_source", "active_in_cycle", "job_title", "state",
-    "recently_worked", "reason",
+    "recently_worked", "contact_status", "reason",
 ]
 DDL = """
 CREATE TABLE IF NOT EXISTS {name} (
@@ -73,49 +84,53 @@ CREATE TABLE IF NOT EXISTS {name} (
     job_title        text,
     state            text,
     recently_worked  text,
+    contact_status   text,
     reason           text,
     created_at       timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (cycle_date, match_key)
 );
 """
+# t1_t2 / t3_t4 are CURRENT STATE: one row per match_key, replaced every run.
+DDL_STATE = DDL.replace("PRIMARY KEY (cycle_date, match_key)", "PRIMARY KEY (match_key)")
 
 def _digits10(p):
     d = re.sub(r"\D", "", p or "")
     return d[-10:] if len(d) >= 10 else None
 
 # ---------------------------------------------------------------- inputs
-def load_replier_keys(progress=print):
-    """Keys of everyone who ever replied via TextTorrent (any verdict) — they are
-    handled by the replier track, never by behavioral scoring. Uses the NEWEST
-    retarget_replied_* export found; warns about its age because the export is a
-    manual snapshot, not something the cycle refreshes."""
+def load_repliers(progress=print):
+    """key -> reply verdict for everyone who ever replied via TextTorrent.
+    Uses the NEWEST retarget_replied_* export found; a manual snapshot the
+    cycle does not refresh — drop in newer exports to keep this current."""
     dirs = sorted(glob.glob(os.path.join(LOCAL_ROOT, "retarget_replied_*")))
-    keys = set()
+    out = {}
     if not dirs:
-        progress("  WARNING: no retarget_replied_* export found — replier exclusion OFF")
-        return keys
+        progress("  WARNING: no retarget_replied_* export found — reply status OFF")
+        return out
     d = dirs[-1]
     progress(f"  replier export: {os.path.basename(d)} "
-             f"(a manual snapshot — drop in a newer one to keep exclusions fresh)")
-    for name in ("retarget_companies.csv", "excluded_do_not_contact.csv"):
+             f"(a manual snapshot — drop in a newer one to keep statuses fresh)")
+    for name, forced in (("retarget_companies.csv", None),
+                         ("excluded_do_not_contact.csv", "opted_out")):
         p = os.path.join(d, name)
         if not os.path.exists(p):
             continue
         with open(p, encoding="utf-8-sig", newline="") as f:
             for r in csv.DictReader(f):
+                v = forced or (r.get("verdict", "") or "replied_other")
                 for ph in re.split(r"[;,]", r.get("phones_replied", "") or ""):
                     k = _digits10(ph)
-                    if k: keys.add(k)
+                    if k: out.setdefault(k, v)
                 for em in re.split(r"[;,]", r.get("emails", "") or ""):
                     em = em.strip().lower()
-                    if em: keys.add(em)
-    return keys
+                    if em: out.setdefault(em, v)
+    return out
 
 def load_worked(progress=print):
     p = os.path.join(ROOT, "recurring_worked_leads.csv")
     worked = {}
     if not os.path.exists(p):
-        progress("  WARNING: recurring_worked_leads.csv not found — cool-off/deal exclusion OFF")
+        progress("  WARNING: recurring_worked_leads.csv not found — cool-off/deal status OFF")
         return worked
     with open(p, encoding="utf-8-sig", newline="") as f:
         for r in csv.DictReader(f):
@@ -193,13 +208,15 @@ def tier_of(score):
 # ---------------------------------------------------------------- main analysis
 def analyze(src_dt, progress=print):
     progress("\nOverlapping analysis (step 6)...")
-    repliers = load_replier_keys(progress)
+    repliers = load_repliers(progress)
     worked = load_worked(progress)
     enrich = load_cycle_enrich(src_dt, progress)
 
     connh = {"conn": S.connect()}
     try:
         cur = connh["conn"].cursor()
+        cur.execute("ALTER TABLE lead_overlaps ADD COLUMN IF NOT EXISTS tier text")
+        connh["conn"].commit()
         cur.execute("""SELECT match_key, key_type, first_name, last_name, company_name,
                               entity_key, matched_on, overlap_count, distinct_days,
                               first_seen, last_seen, seen_dates_text, source_files
@@ -210,29 +227,36 @@ def analyze(src_dt, progress=print):
         table = [dict(zip(cols, r)) for r in cur.fetchall()]
         progress(f"  lead_overlaps: {len(table):,} keys loaded from RDS")
 
-        best = {}   # entity_key -> best-scoring candidate
-        skipped = {"replier": 0, "deal_dni": 0}
+        key_tiers = []           # (match_key, tier) for EVERY key
+        best = {}                # entity_key -> best-scoring candidate row
         for row in table:
             mk = (row["match_key"] or "").strip().lower()
             key = _digits10(mk) if row["key_type"] == "phone" else mk
             if not key: key = mk
-            if key in repliers:
-                skipped["replier"] += 1; continue
             wk = worked.get(key)
-            if wk and (wk["dni"] or "deal/funded" in wk["verdict"]):
-                skipped["deal_dni"] += 1; continue
             en = enrich.get(key, {})
             score, why, intent, n_src, active, rec_worked = score_row(row, en, wk, src_dt)
             tier = tier_of(score)
-            if tier not in ("T1", "T2"):
-                continue
-            phone = en.get("mobile") or (mk if row["key_type"] == "phone" else "")
-            email = mk if row["key_type"] == "email" else ""
+            key_tiers.append({"match_key": row["match_key"], "tier": tier})
+
+            rv = repliers.get(key)
+            if rv == "opted_out":
+                status = "opted_out"; why = why + ["OPTED OUT — DO NOT CONTACT, overrides tier"]
+            elif rv:
+                status = rv; why = why + [f"has replied via TextTorrent ({rv}) — work through the reply track"]
+            elif wk and (wk["dni"] or "deal/funded" in wk["verdict"]):
+                status = "deal_or_do_not_issue"; why = why + ["already a deal or do-not-issue"]
+            elif rec_worked:
+                status = "cooloff_recently_worked"
+            else:
+                status = "ok"
+
             cand = {
                 "cycle_date": src_dt, "match_key": row["match_key"], "rank": 0,
                 "tier": tier, "score": score,
                 "first_name": row["first_name"] or "", "last_name": row["last_name"] or "",
-                "contact_no": phone, "email": email,
+                "contact_no": en.get("mobile") or (mk if row["key_type"] == "phone" else ""),
+                "email": mk if row["key_type"] == "email" else "",
                 "company_name": row["company_name"] or "",
                 "key_type": row["key_type"], "matched_on": row["matched_on"] or "",
                 "overlap_hits": row["overlap_count"] or 0,
@@ -243,6 +267,7 @@ def analyze(src_dt, progress=print):
                 "intent_source": intent, "active_in_cycle": active,
                 "job_title": en.get("title", ""), "state": en.get("state", ""),
                 "recently_worked": f"yes ({wk['days']}d ago)" if rec_worked else "no",
+                "contact_status": status,
                 "reason": " | ".join(why),
             }
             ent = row["entity_key"] or key
@@ -251,21 +276,45 @@ def analyze(src_dt, progress=print):
                 cand["score"] == old["score"] and cand["contact_no"] and not old["contact_no"]):
                 best[ent] = cand
 
-        cands = sorted(best.values(),
-                       key=lambda c: (c["tier"], -(c["score"]), str(c["last_seen"] or "")),
-                       )
+        # ---- 1. refresh lead_overlaps.tier for every key ----
+        cur = connh["conn"].cursor()
+        cur.execute("DROP TABLE IF EXISTS tier_stage")
+        cur.execute("CREATE TEMP TABLE tier_stage (match_key text, tier text)")
+        S.copy_rows(connh, "tier_stage", ["match_key", "tier"], key_tiers,
+                    progress=lambda m: None)
+        cur = connh["conn"].cursor()
+        cur.execute("UPDATE lead_overlaps lo SET tier = s.tier "
+                    "FROM tier_stage s WHERE lo.match_key = s.match_key")
+        n_upd = cur.rowcount
+        cur.execute("DROP TABLE tier_stage")
+        connh["conn"].commit()
+        progress(f"  lead_overlaps.tier refreshed on {n_upd:,} keys")
+
+        cands = sorted(best.values(), key=lambda c: (c["tier"], -c["score"]))
         for i, c in enumerate(cands, 1):
             c["rank"] = i
-        withphone = [c for c in cands if c["contact_no"]]
-        blank = [c for c in cands if not c["contact_no"]]
-        progress(f"  excluded: {skipped['replier']:,} replier keys, {skipped['deal_dni']:,} deal/do-not-issue")
-        progress(f"  T1/T2 targets: {len(withphone):,} with phone -> recontacting_overlaps, "
-                 f"{len(blank):,} without -> upleads_list")
+        t12 = [c for c in cands if c["tier"] in ("T1", "T2")]
+        t34 = [c for c in cands if c["tier"] in ("T3", "T4")]
+        n_promo = {t: sum(1 for c in t12 + t34 if c["tier"] == t) for t in ("T1","T2","T3","T4")}
+        progress(f"  tiers: {n_promo} across {len(cands):,} entities (every row kept)")
 
-        # ---- store (idempotent per cycle_date) ----
+        # ---- 2. current-state tables: full rebuild each run ----
+        for name, rows in (("t1_t2", t12), ("t3_t4", t34)):
+            cur = connh["conn"].cursor()
+            cur.execute(DDL_STATE.format(name=name))
+            cur.execute(f"DELETE FROM {name}")
+            connh["conn"].commit()
+            S.copy_rows(connh, name, TABLE_COLS, rows, progress=progress)
+            progress(f"  {name}: rebuilt with {len(rows):,} rows (current state as of {src_dt})")
+
+        # ---- 3. per-date snapshots of contactable T1/T2 (unchanged behavior) ----
+        contactable = [c for c in t12 if c["contact_status"] == "ok"]
+        withphone = [c for c in contactable if c["contact_no"]]
+        blank = [c for c in contactable if not c["contact_no"]]
         for name, rows in (("recontacting_overlaps", withphone), ("upleads_list", blank)):
             cur = connh["conn"].cursor()
             cur.execute(DDL.format(name=name))
+            cur.execute(f"ALTER TABLE {name} ADD COLUMN IF NOT EXISTS contact_status text")
             cur.execute(f"DELETE FROM {name} WHERE cycle_date=%s", (src_dt,))
             connh["conn"].commit()
             S.copy_rows(connh, name, TABLE_COLS, rows, progress=progress)
@@ -273,17 +322,16 @@ def analyze(src_dt, progress=print):
             cur.execute(f"SELECT count(*) FROM {name}")
             progress(f"  {name}: +{len(rows):,} rows for {src_dt} (table total {cur.fetchone()[0]:,})")
 
-        # ---- local CSV copies ----
+        # ---- 4. local CSV copies ----
         outdir = os.path.join(LOCAL_ROOT, f"cycle_{src_dt}")
         os.makedirs(outdir, exist_ok=True)
-        for fname, rows in ((f"recontacting_overlaps_{src_dt}.csv", withphone),
-                            (f"upleads_list_{src_dt}.csv", blank)):
+        for fname, rows in ((f"t1_t2_{src_dt}.csv", t12), (f"t3_t4_{src_dt}.csv", t34)):
             p = os.path.join(outdir, fname)
             with open(p, "w", encoding="utf-8-sig", newline="") as f:
                 w = csv.DictWriter(f, fieldnames=TABLE_COLS)
                 w.writeheader(); w.writerows(rows)
             progress(f"  local: {p}")
-        return len(withphone), len(blank)
+        return len(t12), len(t34)
     finally:
         try: connh["conn"].close()
         except Exception: pass
