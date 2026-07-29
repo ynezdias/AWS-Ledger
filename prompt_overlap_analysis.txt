@@ -1,0 +1,68 @@
+OVERLAP LEAD ANALYSIS - REUSABLE PROMPT
+(reproduces the analysis done 2026-07-29)
+
+You are analyzing my daily lead overlap data to decide who to target.
+
+INPUT FILES (adjust dates to today):
+1. DataMoon/cycle_<TODAY>/overlapping.csv       - today's incoming records that matched the pool
+2. rds_lead_overlaps.csv                        - RDS overlap table (match history: seen dates, sources, hit counts)
+3. recurring_worked_leads.csv                   - past work history (last_worked_at, deals, do_not_issue, suppress verdicts)
+4. DataMoon/retarget_replied_*/retarget_companies.csv        - TextTorrent reply export (verdict, last_reply_at, last_reply_msg)
+5. DataMoon/retarget_replied_*/excluded_do_not_contact.csv   - opt-outs
+
+MATCHING RULES:
+- Join everything on strong IDs only: normalized email and last-10-digit phone. Company domain as a helper. Never name-only.
+- One row per entity (dedupe on entity_key / best key).
+
+HARD EXCLUSIONS (in this order, before any scoring):
+1. Opted out ("do not contact") - DROP, final, overrides everything.
+2. do_not_issue = TRUE or already a funded deal - DROP.
+3. Worked by a rep in the last 30 days - HOLD (cool-off), unless they replied to us after being worked.
+
+STEP 1 - REPLIERS FIRST (the only leads with PROVEN intent):
+Go through every TextTorrent reply message and classify by what they actually wrote:
+- HOT: interested + named an amount or asked terms/process questions
+- INTERESTED: clear yes / "send me details" / gave an email address
+- LATER: "get back to me in a week/month", deferred but open
+- ENGAGED: replied with something workable but unclear
+- EXCLUDE: negative ("who is this", "wrong number", "not interested"), spam links, sarcasm, bare "?"
+Keep replies from the last 62 days. Rank by most recent reply date first, then strength.
+Flag anyone who ALSO reappeared in today's cycle ("active right now") - that is the strongest combined signal.
+
+STEP 2 - EVERYONE ELSE (behavioral ranking, no messages exist for these):
+Score each remaining overlap entity. Signals and weights:
++40 came from a funding-themed source file (quick_business, merchant_cash_advances, b2c/loan)
+    *** HONESTY WARNING: this is inferred from the vendor's FILE NAME only. The files contain
+    no application/intent field. Confirm with the vendor whether these segments are intent-based
+    (people who inquired) or modeled lookalikes. If modeled, cut this weight. ***
++15 reappeared on 2+ distinct days (from seen_dates)
++15 present in 2+ different source files (independent corroboration)
++15 arrived again in TODAY's cycle (active right now)
++10 matched pool on BOTH email and phone
++10 decision-maker title (owner/founder/CEO/president/principal/partner/chief, or CXO/VP/director seniority)
++5  validated contact data (mobile present or verified email)
+-30 worked by a rep in the last 30 days (flag, do not hide)
+Tiers: T1 >= 70, T2 >= 50, T3 >= 35, T4 below (background, no outreach).
+Sort by most recent last_seen, then score.
+
+KEY PRINCIPLES (do not violate):
+- Their asking beats our guessing, always. A reply outranks every behavioral signal.
+- Repetition with NOTHING changed = vendor file refresh = noise. Repetition WITH change
+  (new source, new field values) = real signal.
+- Same-vendor monthly refresh is NOT corroboration; only different sources count.
+- Every output row must carry a plain-language "reason" column stating exactly which
+  signals fired, with dates. No black-box scores.
+- Be explicit about data provenance and gaps: reply export holds LAST message only,
+  no send-log (silent leads look identical to never-texted), overlap table only holds
+  history since its last rebuild.
+
+OUTPUTS (CSV, in the project root, dated):
+1. interested_recent_ranked_<TODAY>.csv - ranked repliers: rank, tier, window (7d/30d/60d),
+   reply date, days since, contact, company, phone, emails, their exact message, signals,
+   verdict, overlap evidence (hits, distinct days, date range, sources), active_in_todays_cycle, reason.
+2. behavior_ranked_others_<TODAY>.csv - everyone else: rank, tier, score, all overlap
+   fields, intent_source flag, recently_worked flag, reason.
+3. On request, slim contact exports: first_name, last_name, contact_no, company_name, tier -
+   split rows with no phone into a separate upleads file for enrichment.
+Plus a short markdown report: counts per tier, top examples with their messages, what data
+is missing that would change the ranking.

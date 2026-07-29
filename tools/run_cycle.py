@@ -14,6 +14,10 @@ Reads every raw file you uploaded for a date, then:
                 lead_overlaps     <- per-company repeat count + first/last seen
                 S3 "Overlapping Data/dt=<DT>/overlapping_<DT>.csv" <- detail
                 (local copies under DataMoon/cycle_<DT>/)
+  6. ANALYZE    overlap_analysis.py scores lead_overlaps behaviorally and
+                stores T1/T2 targets: recontacting_overlaps (with phone) and
+                upleads_list (email-only). Non-fatal: an analysis failure
+                never rolls back the store above.
 
 Idempotent: re-running a date replaces exactly that date's contribution.
 
@@ -212,6 +216,18 @@ def store(uniq, nn, ov, p_ov, src_dt, ts):
         except Exception: pass
     return tot_ref, tot_ent, rep
 
+def run_analysis(src_dt):
+    """Step 6: overlapping analysis into recontacting_overlaps / upleads_list.
+    Runs only after the store has fully succeeded; a failure here is reported
+    but never undoes the day's stored data."""
+    try:
+        import overlap_analysis as A
+        A.analyze(src_dt, progress=log)
+    except Exception as e:
+        log(f"\nWARNING: overlap analysis failed ({type(e).__name__}: {e}) — "
+            f"cycle data is already stored; re-run just this step with: "
+            f"python tools/overlap_analysis.py {src_dt}")
+
 def store_only(src_dt):
     """Resume a cycle whose compute finished but whose store failed: reuse the
     local CSVs in DataMoon/cycle_<dt>/ instead of recomputing everything."""
@@ -228,6 +244,7 @@ def store_only(src_dt):
     nn  =pd.read_csv(p_nn ,dtype=str,keep_default_na=False)
     log(f"  unique={len(uniq):,}  overlap={len(ov):,}  net-new={len(nn):,}")
     tot_ref,tot_ent,rep = store(uniq, nn, ov, p_ov, src_dt, ts)
+    run_analysis(src_dt)
     log(f"\nDONE. datamoon_refined total={tot_ref:,}; lead_overlaps {tot_ent:,} entities ({rep:,} repeat).")
 
 # ---------------------------------------------------------------- main
@@ -250,6 +267,7 @@ def main(src_dt):
     nn.drop(columns=["in_lead_pool","match_type","matched_pool_keys"]).to_csv(p_nn,index=False,quoting=csv.QUOTE_MINIMAL)
 
     tot_ref, tot_ent, rep = store(uniq, nn, ov, p_ov, src_dt, ts)
+    run_analysis(src_dt)
 
     U=len(uniq); n_ov=len(ov); n_nn=len(nn)
     grp_sum=int(pd.to_numeric(uniq["merged_from_rows"],errors="coerce").fillna(0).sum())
