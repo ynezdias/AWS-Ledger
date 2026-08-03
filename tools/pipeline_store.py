@@ -75,11 +75,24 @@ LEAD_OVERLAPS_MIGRATE = (
 # future DataMoon-history comparison can be told apart from a pool hit.
 POOL_SOURCE = "leadpool"
 
-def connect():
+def connect(timeout=None):
+    """`timeout` is pg8000's SOCKET read timeout, not a query budget: any single
+    statement that runs longer than this dies with 'The read operation timed
+    out' even though the server is still happily working. 180s is fine for the
+    chunked COPYs; whole-table UPDATEs need far more (see connect_long)."""
     c = json.loads(os.environ["DM_SECRET"])
+    if timeout is None: timeout = int(os.environ.get("DM_CONN_TIMEOUT","180"))
     return pg8000.connect(user=c["username"], password=c["password"],
         host=c.get("host") or HOST_FB, port=int(c.get("port",5432)),
-        database=c.get("dbname") or "datamoon", ssl_context=True, timeout=180)
+        database=c.get("dbname") or "datamoon", ssl_context=True, timeout=timeout)
+
+def connect_long(timeout=None):
+    """Connection for long single statements (full-table UPDATEs). Server-side
+    statement_timeout is raised to match so neither side gives up first."""
+    t = timeout or int(os.environ.get("DM_LONG_TIMEOUT","3600"))
+    conn = connect(timeout=t)
+    cur = conn.cursor(); cur.execute(f"SET statement_timeout='{t}s'"); conn.commit()
+    return conn
 
 def load_refiner():
     p=os.path.join(os.path.dirname(os.path.abspath(__file__)),"refine_leads.py")
@@ -215,6 +228,19 @@ DM_LEADS_UNIQUE = (
     "ON datamoon_leads (source_dt, row_id)"
 )
 
+def _row_id(r, src_dt, i):
+    """Prefer a row_id assigned upstream on the FULL unique set.
+
+    datamoon_leads and datamoon_refined used to number rows independently
+    (enumerate over unique_df vs over the net-new subset), so the same string
+    meant two different people -- '2026-07-30-0000005' was Evelyn Mambo in one
+    table and Christopher Wright in the other, and any join on row_id silently
+    paired the wrong leads. run_cycle now stamps row_id once, before the split,
+    so the two tables share one identifier and refined's ids are a subset of
+    leads'. The enumerate fallback keeps older callers working."""
+    rid = str(r.get("row_id") or "").strip()
+    return rid or f"{src_dt}-{i:07d}"
+
 def load_datamoon_leads(connh, unique_df, src_dt, ts, progress=print):
     cur=connh["conn"].cursor()
     cur.execute(DM_LEADS_MIGRATE)
@@ -233,7 +259,7 @@ def load_datamoon_leads(connh, unique_df, src_dt, ts, progress=print):
             "has_valid_phone":bool(ph), "has_valid_email":bool(em),
             "merged_from_rows":r.get("merged_from_rows",""),
             "source_file":r.get("source_file",""),
-            "source_dt":src_dt, "row_id":f"{src_dt}-{i:07d}", "loaded_at":ts.isoformat(),
+            "source_dt":src_dt, "row_id":_row_id(r,src_dt,i), "loaded_at":ts.isoformat(),
         })
         rows.append(row)
     n=copy_rows(connh,"datamoon_leads",DM_LEADS_COLS,rows,progress=progress)
@@ -259,7 +285,7 @@ def load_datamoon_refined(connh, netnew_df, src_dt, ts, progress=print):
     rows=[]
     for i,row in enumerate(netnew_df.to_dict("records")):
         rec=rl.refine({
-            "row_id":f"{src_dt}-{i:07d}", "source_dt":src_dt,
+            "row_id":_row_id(row,src_dt,i), "source_dt":src_dt,
             "first_name":row.get("first_name",""), "last_name":row.get("last_name",""),
             "company_name":row.get("company_name",""), "company_domain":row.get("company_domain",""),
             "job_title":row.get("job_title",""),
@@ -416,7 +442,19 @@ def apply_overlaps(connh, overlap_df, src_dt, progress=print):
 
 # ---------------------------------------------------------------- S3 export
 def upload_overlaps_s3(local_csv, src_dt, progress=print):
+    """Publish the overlap detail to S3. NON-FATAL by design: this is a copy of
+    a file that already exists locally, and it used to run inside store() -- so
+    an expired AWS session here aborted the whole cycle BEFORE tiering, leaving
+    545,065 leads untiered (2026-08-01). A failed convenience upload must not
+    cost the day's tiering; report it and let the caller carry on."""
     uri=f"s3://{RAW_BUCKET}/{OVERLAP_PREFIX}/dt={src_dt}/overlapping_{src_dt}.csv"
-    subprocess.check_call(["aws","s3","cp",local_csv,uri,"--region","us-east-2","--only-show-errors"])
-    progress(f"  overlaps -> {uri}")
-    return uri
+    try:
+        subprocess.check_call(["aws","s3","cp",local_csv,uri,"--region","us-east-2",
+                               "--only-show-errors"])
+        progress(f"  overlaps -> {uri}")
+        return uri
+    except Exception as e:
+        progress(f"  WARNING: overlap S3 export FAILED ({type(e).__name__}) — "
+                 f"local copy is intact at {local_csv}\n"
+                 f"           re-upload with: aws s3 cp \"{local_csv}\" \"{uri}\" --region us-east-2")
+        return None

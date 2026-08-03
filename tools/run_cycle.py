@@ -224,9 +224,33 @@ def run_analysis(src_dt):
         import overlap_analysis as A
         A.analyze(src_dt, progress=log)
     except Exception as e:
-        log(f"\nWARNING: overlap analysis failed ({type(e).__name__}: {e}) — "
-            f"cycle data is already stored; re-run just this step with: "
-            f"python tools/overlap_analysis.py {src_dt}")
+        # Loud, not advisory: this step failing means leads are UNTIERED and the
+        # call lists are stale, which is not a complete cycle. The old wording
+        # ("cycle data is already stored") read as harmless and hid 948k
+        # untiered rows on 2026-07-30.
+        log(f"\n{'!'*68}\n!! CYCLE INCOMPLETE — tiering/list update FAILED\n"
+            f"!!   {type(e).__name__}: {e}\n"
+            f"!! Raw/refined data for {src_dt} IS stored, but leads are NOT tiered\n"
+            f"!! and t1_t2/t3_t4/recontacting_overlaps/upleads_list may be stale.\n"
+            f"!! FIX: python tools/overlap_analysis.py {src_dt}\n{'!'*68}")
+        raise SystemExit(f"cycle incomplete: tiering failed for {src_dt}")
+
+def verify_tiers(src_dt, progress=log):
+    """Prove the tiering actually landed. analyze() logs nothing for steps it
+    never reaches, so a clean-looking log is not evidence -- only the table is."""
+    conn=S.connect()
+    try:
+        cur=conn.cursor(); bad=[]
+        for t in ("datamoon_leads","datamoon_refined"):
+            cur.execute(f"select count(*), count(tier) from {t} where source_dt=%s",(src_dt,))
+            n,tiered=cur.fetchone()
+            progress(f"  {t:17} {src_dt}: {n:,} rows / {tiered:,} tiered")
+            if n and tiered<n: bad.append(f"{t} {n-tiered:,} untiered")
+        if bad: raise SystemExit("TIER VERIFY FAILED: "+"; ".join(bad))
+        progress("  tier verify: OK")
+    finally:
+        try: conn.close()
+        except Exception: pass
 
 def store_only(src_dt):
     """Resume a cycle whose compute finished but whose store failed: reuse the
@@ -245,6 +269,7 @@ def store_only(src_dt):
     log(f"  unique={len(uniq):,}  overlap={len(ov):,}  net-new={len(nn):,}")
     tot_ref,tot_ent,rep = store(uniq, nn, ov, p_ov, src_dt, ts)
     run_analysis(src_dt)
+    verify_tiers(src_dt)
     log(f"\nDONE. datamoon_refined total={tot_ref:,}; lead_overlaps {tot_ent:,} entities ({rep:,} repeat).")
 
 # ---------------------------------------------------------------- main
@@ -254,6 +279,13 @@ def main(src_dt):
     files=fetch_raw(src_dt)
     rows_in, uniq, stats = normalize_dedup(files)
     uniq = overlap(uniq)
+
+    # Stamp the identifier ONCE on the full unique set, before splitting. Both
+    # datamoon_leads and datamoon_refined then use the same row_id for the same
+    # person; numbering them separately downstream made the id mean two
+    # different leads in the two tables.
+    uniq=uniq.reset_index(drop=True)
+    uniq["row_id"]=[f"{src_dt}-{i:07d}" for i in range(len(uniq))]
 
     ov=uniq[uniq["in_lead_pool"]=="yes"].copy()
     nn=uniq[uniq["in_lead_pool"]=="no"].copy()
@@ -268,6 +300,7 @@ def main(src_dt):
 
     tot_ref, tot_ent, rep = store(uniq, nn, ov, p_ov, src_dt, ts)
     run_analysis(src_dt)
+    verify_tiers(src_dt)
 
     U=len(uniq); n_ov=len(ov); n_nn=len(nn)
     grp_sum=int(pd.to_numeric(uniq["merged_from_rows"],errors="coerce").fillna(0).sum())

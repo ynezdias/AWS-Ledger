@@ -258,17 +258,43 @@ UPDATE datamoon_refined SET tier = CASE
 END
 """
 
-def apply_lead_tiers(connh, progress=print):
+def apply_lead_tiers(connh, progress=print, src_dt=None):
+    """Tier every lead. These are whole-table UPDATEs over ~2M rows, which run
+    far longer than the 180s socket timeout the normal connection uses -- that
+    silently killed this step on 2026-07-30 and left 948k rows untiered while
+    the run only logged a soft warning. Use a dedicated long-timeout
+    connection, and close it here so the caller's connection is untouched."""
+    conn = S.connect_long()
+    connh = {"conn": conn}          # shadow: everything below runs on the long conn
+    try:
+        _apply_lead_tiers(connh, progress, src_dt)
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+def _apply_lead_tiers(connh, progress=print, src_dt=None):
     cur = connh["conn"].cursor()
     cur.execute("ALTER TABLE datamoon_leads ADD COLUMN IF NOT EXISTS tier text")
     cur.execute("ALTER TABLE datamoon_refined ADD COLUMN IF NOT EXISTS tier text")
     connh["conn"].commit()
 
-    # pass 1: quality tier for every row
-    cur.execute(LEADS_QUALITY_SQL); n1 = cur.rowcount; connh["conn"].commit()
+    # pass 1: quality tier. Its inputs (source_file, job_title, seniority, the
+    # validity flags) are immutable once a date is stored, so re-deriving every
+    # past date each night was pure waste -- and the cost grew with the table,
+    # which is what pushed this step past the timeout. Scope to the date being
+    # run; pass `src_dt=None` to re-tier everything (backfill / rule change).
+    # Rows never tiered (tier IS NULL) are always included, so a date that
+    # missed this step still gets picked up.
+    where, args = "", ()
+    if src_dt:
+        where = " WHERE (source_dt = %s OR tier IS NULL)"; args = (src_dt,)
+    cur.execute(LEADS_QUALITY_SQL + where, args); n1 = cur.rowcount
+    connh["conn"].commit()
     cur = connh["conn"].cursor()
-    cur.execute(REFINED_QUALITY_SQL); n2 = cur.rowcount; connh["conn"].commit()
-    progress(f"  quality tiers set: datamoon_leads {n1:,}, datamoon_refined {n2:,}")
+    cur.execute(REFINED_QUALITY_SQL + where, args); n2 = cur.rowcount
+    connh["conn"].commit()
+    scope = f"for {src_dt} (+any untiered)" if src_dt else "for ALL dates"
+    progress(f"  quality tiers set {scope}: datamoon_leads {n1:,}, datamoon_refined {n2:,}")
 
     # pass 2: overlap behavior overrides quality where it exists
     cur = connh["conn"].cursor()
@@ -286,19 +312,14 @@ def apply_lead_tiers(connh, progress=print):
                      AND dl.tier IS DISTINCT FROM t.tier""")
     n3 = cur.rowcount
     cur.execute("DROP TABLE dl_ov")
-    cur.execute("""
-        CREATE TEMP TABLE dr_ov AS
-        SELECT r.row_id, min(lo.tier) AS tier
-        FROM datamoon_refined r
-        JOIN lead_overlaps lo ON lo.tier IS NOT NULL
-             AND lo.match_key IN (r.email_norm, r.phone_e164)
-        GROUP BY 1""")
-    cur.execute("""UPDATE datamoon_refined r SET tier = t.tier FROM dr_ov t
-                   WHERE r.row_id = t.row_id AND r.tier IS DISTINCT FROM t.tier""")
-    n4 = cur.rowcount
-    cur.execute("DROP TABLE dr_ov")
+    # NO equivalent pass for datamoon_refined. It holds only NET-NEW leads --
+    # rows where none of the lead's keys matched the pool -- while lead_overlaps
+    # holds only keys that DID match. The two sets are disjoint by construction,
+    # so the old dr_ov join scanned 2M rows to update exactly 0 every run
+    # (measured 2026-07-30: 0 of 2,024,783). Refined keeps its quality tier.
     connh["conn"].commit()
-    progress(f"  overlap behavior overrides: datamoon_leads {n3:,}, datamoon_refined {n4:,}")
+    progress(f"  overlap behavior overrides: datamoon_leads {n3:,} "
+             f"(refined: n/a — net-new cannot overlap)")
     return n1, n2
 
 # ---------------------------------------------------------------- main analysis
@@ -419,7 +440,7 @@ def analyze(src_dt, progress=print):
             progress(f"  {name}: +{len(rows):,} rows for {src_dt} (table total {cur.fetchone()[0]:,})")
 
         # ---- 4. tier every lead in datamoon_leads / datamoon_refined ----
-        apply_lead_tiers(connh, progress)
+        apply_lead_tiers(connh, progress, src_dt)
 
         # ---- 5. local CSV copies ----
         outdir = os.path.join(LOCAL_ROOT, f"cycle_{src_dt}")
