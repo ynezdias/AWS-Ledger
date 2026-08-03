@@ -74,7 +74,9 @@ MIN_KEY_YIELD = float(os.environ.get("MIN_KEY_YIELD", "0.5"))
 def normalize_dedup(files):
     frames=[]; total=0; stats={"bad_lines":0}
     for f in files:
-        n=0; base=os.path.basename(f)
+        n=0; base=N.canon_source(os.path.basename(f))
+        if base != os.path.basename(f):
+            log(f"  source name canonicalised: {os.path.basename(f)!r} -> {base!r}")
         for chunk in N.load_any(f, stats=stats):
             # Provenance: which raw file this row arrived in. dedupe() unions
             # these across a merge group, so a lead built from rows in two files

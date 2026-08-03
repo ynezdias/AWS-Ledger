@@ -95,6 +95,36 @@ def _to_canon(df):
         if c not in df.columns: df[c]=""
     return df[CANON]
 
+# ---------------------------------------------------------------- source names
+# The vendor spells the same list differently almost every day -- observed so far:
+#   ",Small Business, Funding and Loans,Kapitus.csv"   (leading comma)
+#   "Small Business,Fundaing and Loans,Kapitus.csv"    (typo)
+#   "Small Business, Funding, Loans Kapitus.csv"       (no "and", space not comma)
+#   "constructio, capital & sale.csv"                  (typo)
+# source_file is stored literally, so each spelling became its own bucket and
+# broke day-over-day grouping. Canonicalise on the way in rather than patching
+# the database afterwards -- a manual patch is easy to forget, and was.
+def _collapse(name):
+    s = re.sub(r"\.csv$", "", (name or "").strip(), flags=re.I).lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return " ".join(t for t in s.split() if t != "and")
+
+SOURCE_CANON = {
+    "small business funding loans kapitus":  "Small Business, Funding and Loans,Kapitus.csv",
+    "small business fundaing loans kapitus": "Small Business, Funding and Loans,Kapitus.csv",
+    "construction capital sale":             "construction, capital & sale.csv",
+    "constructio capital sale":              "construction, capital & sale.csv",
+    "quick business":                        "quick_business.csv",
+    "b2b estate healthcare commerce":        "b2b estate, healthcare & commerce.csv",
+    "merchant cash advances":                "merchant_cash_advances.csv",
+    "b2c":                                   "b2c.csv",
+}
+
+def canon_source(name):
+    """Canonical list name for a raw filename. Unknown files pass through
+    unchanged, so a genuinely new list is never silently folded into another."""
+    return SOURCE_CANON.get(_collapse(name), name)
+
 KEY_SRC_COLS = ["personal_emails","business_email","additional_personal_emails",
                 "personal_phone","mobile_phone"]
 
